@@ -87,12 +87,16 @@ router.post('/upload-file', protect, async (req, res) => {
     const filePath = path.join(DOCS_DIR, uniqueFileName);
     fs.writeFileSync(filePath, buffer);
 
-    const localUrl = `/uploads/documents/${uniqueFileName}`;
+    const localPath = `/uploads/documents/${uniqueFileName}`;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.get('host') || '127.0.0.1:5000';
+    const absoluteUrl = `${protocol}://${host}${localPath}`;
 
     return res.json({
       success: true,
       file: {
-        url: localUrl,
+        url: absoluteUrl,
+        localPath,
         name: safeName,
         fileType: mimeType || typeStr,
         fileSize: buffer.length || sizeNum
@@ -178,13 +182,21 @@ router.post('/upload-voice', protect, async (req, res) => {
     const filePath = path.join(VOICE_DIR, filename);
     fs.writeFileSync(filePath, buffer);
 
-    const localUrl = `/uploads/voice/${filename}`;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.get('host') || '127.0.0.1:5000';
+    const absoluteUrl = `${protocol}://${host}/uploads/voice/${filename}`;
+
+    // For recordings under 2.5MB (~2-3 minutes), data URI provides 100% permanence in MongoDB Atlas,
+    // immunity to Render container wipes on sleep/restart, and instant cross-origin playback on Vercel.
+    const isSmallAudio = audio.startsWith('data:audio') && base64Data.length < 2500000;
+    const finalVoiceUrl = isSmallAudio ? audio : absoluteUrl;
 
     return res.json({
       success: true,
-      voiceUrl: localUrl,
+      voiceUrl: finalVoiceUrl,
+      fileUrl: absoluteUrl,
       voiceDuration: durationNum,
-      provider: 'local'
+      provider: isSmallAudio ? 'data_uri' : 'local'
     });
   } catch (error) {
     console.error('Upload voice error:', error);
