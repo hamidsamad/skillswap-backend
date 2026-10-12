@@ -165,20 +165,23 @@ router.post('/google', authLimiter, async (req, res) => {
     // Case 1: Google ID token (credential) passed
     if (credential) {
       const clientId = process.env.GOOGLE_CLIENT_ID;
-      if (!clientId) {
-        return res.status(500).json({
-          success: false,
-          message: 'Google OAuth is not configured on the server. Please configure GOOGLE_CLIENT_ID in the backend environment variables.'
-        });
-      }
 
       try {
-        const client = new OAuth2Client(clientId);
-        const ticket = await client.verifyIdToken({
-          idToken: credential,
-          audience: clientId
-        });
-        googlePayload = ticket.getPayload();
+        if (clientId) {
+          const client = new OAuth2Client(clientId);
+          const ticket = await client.verifyIdToken({
+            idToken: credential,
+            audience: clientId
+          });
+          googlePayload = ticket.getPayload();
+        } else {
+          // If server GOOGLE_CLIENT_ID is not yet configured, verify signature directly with Google tokeninfo API
+          const verifyRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`);
+          if (!verifyRes.ok) {
+            throw new Error('Google tokeninfo service rejected the token');
+          }
+          googlePayload = await verifyRes.json();
+        }
       } catch (verifyErr) {
         console.error('Google ID token verification failed:', verifyErr.message);
         return res.status(401).json({
@@ -190,6 +193,30 @@ router.post('/google', authLimiter, async (req, res) => {
     // Case 2: Google OAuth access token passed
     else {
       try {
+        const clientId = process.env.GOOGLE_CLIENT_ID;
+
+        // Verify token validity with Google tokeninfo
+        const tokenInfoRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+        if (!tokenInfoRes.ok) {
+          const errData = await tokenInfoRes.text();
+          console.error('Google tokeninfo check failed:', errData);
+          return res.status(401).json({
+            success: false,
+            message: 'Invalid Google access token or token has expired.'
+          });
+        }
+        const tokenInfo = await tokenInfoRes.json();
+
+        // Enforce audience match if backend GOOGLE_CLIENT_ID is configured
+        if (clientId && tokenInfo.aud && tokenInfo.aud !== clientId) {
+          console.error(`Token audience mismatch: expected ${clientId}, got ${tokenInfo.aud}`);
+          return res.status(403).json({
+            success: false,
+            message: 'Google token was not issued for this application Client ID.'
+          });
+        }
+
+        // Fetch verified user profile from Google UserInfo
         const googleUserRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
           headers: {
             Authorization: `Bearer ${token}`
@@ -207,7 +234,7 @@ router.post('/google', authLimiter, async (req, res) => {
 
         googlePayload = await googleUserRes.json();
       } catch (fetchErr) {
-        console.error('Error contacting Google userinfo API:', fetchErr.message);
+        console.error('Error contacting Google identity services:', fetchErr.message);
         return res.status(500).json({
           success: false,
           message: 'Failed to verify Google access token with Google identity services.'
