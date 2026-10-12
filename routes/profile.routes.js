@@ -2,6 +2,7 @@ import express from 'express';
 import mongoose from 'mongoose';
 import { Profile, User, Skill } from '../config/db.js';
 import { protect, optionalAuth } from '../middleware/auth.js';
+import { broadcastPlatformStatistics } from '../utils/statisticsHelper.js';
 
 const router = express.Router();
 
@@ -151,6 +152,9 @@ router.put('/me', protect, async (req, res) => {
       safeUser = { ...safeUser };
     }
     if (safeUser) delete safeUser.password;
+
+    // Broadcast updated platform statistics (skills, cities, industries)
+    broadcastPlatformStatistics(req.app.get('io'));
 
     res.json({ success: true, profile: populated, user: safeUser });
   } catch (error) {

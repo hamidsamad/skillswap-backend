@@ -25,6 +25,7 @@ import chatRoutes from './routes/chat.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import reportRoutes from './routes/reports.routes.js';
 import notificationRoutes from './routes/notifications.routes.js';
+import statisticsRoutes from './routes/statistics.routes.js';
 
 dotenv.config();
 
@@ -303,6 +304,7 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/statistics', statisticsRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

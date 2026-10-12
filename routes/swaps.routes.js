@@ -1,6 +1,7 @@
 import express from 'express';
 import { SwapAgreement, Conversation, Message, User, Profile } from '../config/db.js';
 import { protect } from '../middleware/auth.js';
+import { broadcastPlatformStatistics } from '../utils/statisticsHelper.js';
 
 const router = express.Router();
 
@@ -209,6 +210,9 @@ router.patch('/:id/status', protect, async (req, res) => {
       await Profile.updateOne({ user: proposerIdStr }, { $inc: { completedSwapsCount: 1 } });
       await Profile.updateOne({ user: recipientIdStr }, { $inc: { completedSwapsCount: 1 } });
     }
+
+    // Broadcast updated platform statistics (successful swaps)
+    broadcastPlatformStatistics(req.app.get('io'));
 
     res.json({ success: true, swap: updated });
   } catch (error) {

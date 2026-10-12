@@ -1,5 +1,6 @@
 import express from 'express';
 import { User, Profile, Skill, SwapAgreement, Report, AuditLog, Notification } from '../config/db.js';
+import { broadcastPlatformStatistics } from '../utils/statisticsHelper.js';
 import { protect } from '../middleware/auth.js';
 import { requireAdmin } from '../middleware/admin.js';
 
@@ -843,6 +844,9 @@ router.patch('/users/:id/suspend', async (req, res) => {
         reason: isSuspending ? reason.trim() : ''
       });
     }
+
+    // Broadcast updated platform statistics (active members count)
+    broadcastPlatformStatistics(req.app.get('io'));
 
     res.json({
       success: true,

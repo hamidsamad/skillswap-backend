@@ -8,6 +8,7 @@ import { User, Profile, Skill, SwapAgreement } from '../config/db.js';
 import { protect, JWT_SECRET } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rateLimiter.js';
 import { OAuth2Client } from 'google-auth-library';
+import { broadcastPlatformStatistics } from '../utils/statisticsHelper.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,6 +73,9 @@ router.post('/register', authLimiter, async (req, res) => {
     const token = generateToken(user._id);
 
     const safeUser = getSafeUser(user);
+
+    // Broadcast real-time platform statistics update
+    broadcastPlatformStatistics(req.app.get('io'));
 
     res.status(201).json({
       success: true,
@@ -332,6 +336,10 @@ router.post('/google', authLimiter, async (req, res) => {
     // Step 6: Issue application's normal JWT token
     const tokenPayload = generateToken(user._id);
     const safeUser = getSafeUser(user);
+
+    if (isNewUser) {
+      broadcastPlatformStatistics(req.app.get('io'));
+    }
 
     res.json({
       success: true,
