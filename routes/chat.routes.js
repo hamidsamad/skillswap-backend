@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import multer from 'multer';
 import { Conversation, Message, User, SwapAgreement } from '../config/db.js';
 import { protect } from '../middleware/auth.js';
 import { cloudinary, isCloudinaryConfigured } from '../config/cloudinary.js';
@@ -18,27 +19,104 @@ if (!fs.existsSync(DOCS_DIR)) {
   fs.mkdirSync(DOCS_DIR, { recursive: true });
 }
 
+// Multer memory storage for high-speed streaming without base64 overhead
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 30 * 1024 * 1024 // 30MB max
+  }
+});
+
+// Helper for streaming binary buffers directly to Cloudinary
+const uploadStreamToCloudinary = (buffer, options) => {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(options, (error, result) => {
+      if (error) reject(error);
+      else resolve(result);
+    });
+    stream.end(buffer);
+  });
+};
+
 const router = express.Router();
 
-// @route   POST /api/chat/upload-file
-// @desc    Upload documents, assignments, pictures, and other files (Cloudinary + local fallback)
-router.post('/upload-file', protect, async (req, res) => {
+// @route   GET /api/chat/storage/sign
+// @desc    Get secure signed parameters for direct browser uploads when Cloudinary is configured
+router.get('/storage/sign', protect, (req, res) => {
   try {
-    const { fileData, fileName, fileType, fileSize } = req.body;
-    if (!fileData) {
-      return res.status(400).json({ success: false, message: 'File data is required' });
+    if (!isCloudinaryConfigured) {
+      return res.json({ success: false, configured: false });
+    }
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder = 'skillswap/chat_media';
+    const signature = cloudinary.utils.api_sign_request(
+      { timestamp, folder },
+      process.env.CLOUDINARY_API_SECRET
+    );
+    res.json({
+      success: true,
+      configured: true,
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME || process.env.CLOUDINARY_NAME,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+      timestamp,
+      folder,
+      signature
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route   POST /api/chat/upload-file
+// @desc    High-speed upload for documents, images, assignments (Supports Multipart Binary + Base64 fallback)
+router.post('/upload-file', protect, upload.single('file'), async (req, res) => {
+  try {
+    let buffer = null;
+    let fileName = '';
+    let fileType = '';
+    let fileSize = 0;
+
+    // 1. Binary multipart upload via multer (fastest, lowest memory & bandwidth)
+    if (req.file) {
+      buffer = req.file.buffer;
+      fileName = req.file.originalname;
+      fileType = req.file.mimetype;
+      fileSize = req.file.size;
+    }
+    // 2. Base64 fallback from req.body
+    else if (req.body.fileData) {
+      const { fileData, fileName: bName, fileType: bType, fileSize: bSize } = req.body;
+      fileName = bName || 'document.pdf';
+      fileType = bType || 'application/octet-stream';
+      fileSize = Number(bSize) || 0;
+
+      let base64Data = fileData;
+      if (fileData.includes(';base64,')) {
+        const parts = fileData.split(';base64,');
+        fileType = parts[0].replace(/^data:/, '') || fileType;
+        base64Data = parts[1];
+      } else if (fileData.startsWith('data:')) {
+        const commaIdx = fileData.indexOf(',');
+        if (commaIdx !== -1) {
+          fileType = fileData.slice(5, commaIdx).split(';')[0] || fileType;
+          base64Data = fileData.slice(commaIdx + 1);
+        }
+      }
+      buffer = Buffer.from(base64Data, 'base64');
     }
 
-    const safeName = (fileName || 'document.pdf').replace(/[^a-zA-Z0-9._-]/g, '_');
-    const sizeNum = Number(fileSize) || 0;
-    const typeStr = fileType || 'application/octet-stream';
-    const isImage = typeStr.startsWith('image/');
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ success: false, message: 'Valid file data is required' });
+    }
 
-    // 1. Try Cloudinary if configured
+    const safeName = (fileName || 'attachment').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const isImage = fileType.startsWith('image/');
+
+    // 3. Cloudinary Upload via direct binary stream
     if (isCloudinaryConfigured) {
       try {
-        console.log(`☁️ Uploading document/file (${safeName}) to Cloudinary...`);
-        const result = await cloudinary.uploader.upload(fileData, {
+        console.log(`☁️ Streaming file (${safeName}) directly to Cloudinary...`);
+        const result = await uploadStreamToCloudinary(buffer, {
           folder: 'skillswap/documents',
           resource_type: isImage ? 'image' : 'auto',
           public_id: `doc_${req.user._id}_${Date.now()}`
@@ -49,43 +127,23 @@ router.post('/upload-file', protect, async (req, res) => {
           file: {
             url: result.secure_url,
             name: safeName,
-            fileType: typeStr,
-            fileSize: result.bytes || sizeNum
+            fileType,
+            fileSize: result.bytes || fileSize || buffer.length
           },
           provider: 'cloudinary'
         });
       } catch (cloudErr) {
-        console.warn('⚠️ Cloudinary file upload issue, falling back to local storage:', cloudErr.message);
+        console.warn('⚠️ Cloudinary streaming issue, falling back to local file storage:', cloudErr.message);
       }
     }
 
-    // 2. Local File Storage Fallback
-    console.log(`💾 Saving document/file (${safeName}) to local storage...`);
-    let mimeType = typeStr;
-    let base64Data = fileData;
-
-    if (fileData.includes(';base64,')) {
-      const parts = fileData.split(';base64,');
-      mimeType = parts[0].replace(/^data:/, '');
-      base64Data = parts[1];
-    } else if (fileData.startsWith('data:')) {
-      const commaIdx = fileData.indexOf(',');
-      if (commaIdx !== -1) {
-        mimeType = fileData.slice(5, commaIdx).split(';')[0];
-        base64Data = fileData.slice(commaIdx + 1);
-      }
-    }
-
-    const buffer = Buffer.from(base64Data, 'base64');
-    if (!buffer || buffer.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid or empty file data' });
-    }
-
-    const ext = path.extname(safeName) || (isImage ? '.png' : '.bin');
+    // 4. Local File Storage (Asynchronous non-blocking write)
+    const ext = path.extname(safeName) || (isImage ? '.webp' : '.bin');
     const baseWithoutExt = path.basename(safeName, ext);
     const uniqueFileName = `${baseWithoutExt}_${req.user._id}_${Date.now()}${ext}`;
     const filePath = path.join(DOCS_DIR, uniqueFileName);
-    fs.writeFileSync(filePath, buffer);
+
+    await fs.promises.writeFile(filePath, buffer);
 
     const localPath = `/uploads/documents/${uniqueFileName}`;
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -98,8 +156,8 @@ router.post('/upload-file', protect, async (req, res) => {
         url: absoluteUrl,
         localPath,
         name: safeName,
-        fileType: mimeType || typeStr,
-        fileSize: buffer.length || sizeNum
+        fileType,
+        fileSize: buffer.length
       },
       provider: 'local'
     });
@@ -110,22 +168,49 @@ router.post('/upload-file', protect, async (req, res) => {
 });
 
 // @route   POST /api/chat/upload-voice
-// @desc    Upload recorded voice message using Cloudinary (with local storage fallback)
-router.post('/upload-voice', protect, async (req, res) => {
+// @desc    High-speed binary upload for voice messages (Supports Multipart + Base64 fallback)
+router.post('/upload-voice', protect, upload.single('audio'), async (req, res) => {
   try {
-    const { audio, duration } = req.body;
-    if (!audio) {
+    let buffer = null;
+    let durationNum = 0;
+    let mimeType = 'audio/webm';
+
+    // 1. Binary multipart upload via multer (fastest)
+    if (req.file) {
+      buffer = req.file.buffer;
+      durationNum = parseFloat(req.body.duration) || 0;
+      mimeType = req.file.mimetype || 'audio/webm';
+    }
+    // 2. Base64 fallback from req.body
+    else if (req.body.audio) {
+      const { audio, duration } = req.body;
+      durationNum = parseFloat(duration) || 0;
+
+      let base64Data = audio;
+      if (audio.includes(';base64,')) {
+        const parts = audio.split(';base64,');
+        mimeType = parts[0].replace(/^data:/, '');
+        base64Data = parts[1];
+      } else if (audio.startsWith('data:')) {
+        const commaIdx = audio.indexOf(',');
+        if (commaIdx !== -1) {
+          mimeType = audio.slice(5, commaIdx).split(';')[0];
+          base64Data = audio.slice(commaIdx + 1);
+        }
+      }
+      buffer = Buffer.from(base64Data, 'base64');
+    }
+
+    if (!buffer || buffer.length === 0) {
       return res.status(400).json({ success: false, message: 'Audio data is required' });
     }
 
-    const durationNum = parseFloat(duration) || 0;
-
-    // 1. If Cloudinary is configured, attempt upload to Cloudinary
+    // 3. Cloudinary Upload via direct binary stream
     if (isCloudinaryConfigured) {
       try {
-        console.log('☁️ Uploading voice recording to Cloudinary...');
-        const result = await cloudinary.uploader.upload(audio, {
-          resource_type: 'video', // Cloudinary processes audio recordings under video
+        console.log('☁️ Streaming voice recording directly to Cloudinary...');
+        const result = await uploadStreamToCloudinary(buffer, {
+          resource_type: 'video',
           folder: 'skillswap/voice_messages',
           public_id: `voice_${req.user._id}_${Date.now()}`
         });
@@ -137,41 +222,11 @@ router.post('/upload-voice', protect, async (req, res) => {
           provider: 'cloudinary'
         });
       } catch (cloudErr) {
-        console.warn('⚠️ Cloudinary upload issue, falling back to local file storage:', cloudErr.message);
+        console.warn('⚠️ Cloudinary voice streaming issue, falling back to local file storage:', cloudErr.message);
       }
     }
 
-    // 2. Local File Storage Fallback (if Cloudinary not configured or network unreachable)
-    console.log('💾 Saving voice recording to local storage...');
-    if (audio.startsWith('http://') || audio.startsWith('https://')) {
-      return res.json({
-        success: true,
-        voiceUrl: audio,
-        voiceDuration: durationNum,
-        provider: 'direct'
-      });
-    }
-
-    let mimeType = 'audio/webm';
-    let base64Data = audio;
-
-    if (audio.includes(';base64,')) {
-      const parts = audio.split(';base64,');
-      mimeType = parts[0].replace(/^data:/, '');
-      base64Data = parts[1];
-    } else if (audio.startsWith('data:')) {
-      const commaIdx = audio.indexOf(',');
-      if (commaIdx !== -1) {
-        mimeType = audio.slice(5, commaIdx).split(';')[0];
-        base64Data = audio.slice(commaIdx + 1);
-      }
-    }
-
-    const buffer = Buffer.from(base64Data, 'base64');
-    if (!buffer || buffer.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid or empty audio data' });
-    }
-    
+    // 4. Local File Storage (Asynchronous non-blocking write)
     let ext = 'webm';
     if (mimeType.includes('mp4') || mimeType.includes('m4a')) ext = 'mp4';
     else if (mimeType.includes('ogg')) ext = 'ogg';
@@ -180,23 +235,19 @@ router.post('/upload-voice', protect, async (req, res) => {
 
     const filename = `voice_${req.user._id}_${Date.now()}.${ext}`;
     const filePath = path.join(VOICE_DIR, filename);
-    fs.writeFileSync(filePath, buffer);
+
+    await fs.promises.writeFile(filePath, buffer);
 
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
     const host = req.get('host') || '127.0.0.1:5000';
     const absoluteUrl = `${protocol}://${host}/uploads/voice/${filename}`;
 
-    // For recordings under 2.5MB (~2-3 minutes), data URI provides 100% permanence in MongoDB Atlas,
-    // immunity to Render container wipes on sleep/restart, and instant cross-origin playback on Vercel.
-    const isSmallAudio = audio.startsWith('data:audio') && base64Data.length < 2500000;
-    const finalVoiceUrl = isSmallAudio ? audio : absoluteUrl;
-
     return res.json({
       success: true,
-      voiceUrl: finalVoiceUrl,
+      voiceUrl: absoluteUrl,
       fileUrl: absoluteUrl,
       voiceDuration: durationNum,
-      provider: isSmallAudio ? 'data_uri' : 'local'
+      provider: 'local'
     });
   } catch (error) {
     console.error('Upload voice error:', error);

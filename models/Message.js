@@ -51,4 +51,8 @@ const messageSchema = new mongoose.Schema(
   }
 );
 
+// High-performance compound indexes for instant message loading and sorting
+messageSchema.index({ conversation: 1, createdAt: 1 });
+messageSchema.index({ sender: 1 });
+
 export default mongoose.model('Message', messageSchema);

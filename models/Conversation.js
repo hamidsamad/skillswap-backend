@@ -28,4 +28,7 @@ const conversationSchema = new mongoose.Schema(
   }
 );
 
+// High-performance index for participant lookups & conversation sorting
+conversationSchema.index({ participants: 1, lastMessageAt: -1 });
+
 export default mongoose.model('Conversation', conversationSchema);
