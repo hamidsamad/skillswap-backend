@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { User, Profile, Skill, SwapAgreement } from '../config/db.js';
 import { protect, JWT_SECRET } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rateLimiter.js';
+import { OAuth2Client } from 'google-auth-library';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -142,6 +143,182 @@ router.post('/login', authLimiter, async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ success: false, message: error.message || 'Server error during login' });
+  }
+});
+
+// @route   POST /api/auth/google
+// @desc    Authenticate or register user using genuine verified Google OAuth identity
+router.post('/google', authLimiter, async (req, res) => {
+  try {
+    const { credential, access_token, accessToken } = req.body;
+    const token = credential || access_token || accessToken;
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: 'Google authentication credential or access token is required'
+      });
+    }
+
+    let googlePayload = null;
+
+    // Case 1: Google ID token (credential) passed
+    if (credential) {
+      const clientId = process.env.GOOGLE_CLIENT_ID;
+      if (!clientId) {
+        return res.status(500).json({
+          success: false,
+          message: 'Google OAuth is not configured on the server. Please configure GOOGLE_CLIENT_ID in the backend environment variables.'
+        });
+      }
+
+      try {
+        const client = new OAuth2Client(clientId);
+        const ticket = await client.verifyIdToken({
+          idToken: credential,
+          audience: clientId
+        });
+        googlePayload = ticket.getPayload();
+      } catch (verifyErr) {
+        console.error('Google ID token verification failed:', verifyErr.message);
+        return res.status(401).json({
+          success: false,
+          message: 'Google ID token verification failed. The token is invalid or has expired.'
+        });
+      }
+    }
+    // Case 2: Google OAuth access token passed
+    else {
+      try {
+        const googleUserRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+
+        if (!googleUserRes.ok) {
+          const errData = await googleUserRes.text();
+          console.error('Google userinfo fetch failed:', errData);
+          return res.status(401).json({
+            success: false,
+            message: 'Invalid Google access token or token has expired.'
+          });
+        }
+
+        googlePayload = await googleUserRes.json();
+      } catch (fetchErr) {
+        console.error('Error contacting Google userinfo API:', fetchErr.message);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to verify Google access token with Google identity services.'
+        });
+      }
+    }
+
+    if (!googlePayload || !googlePayload.email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Unable to retrieve verified email from Google identity'
+      });
+    }
+
+    // Verify email_verified status strictly
+    const isEmailVerified = googlePayload.email_verified === true || googlePayload.email_verified === 'true';
+    if (!isEmailVerified) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your Google email address is not verified by Google. Please verify your Google email before signing in.'
+      });
+    }
+
+    const googleId = googlePayload.sub;
+    const email = googlePayload.email.toLowerCase().trim();
+    const name = googlePayload.name || email.split('@')[0];
+    const picture = googlePayload.picture || '';
+
+    // Step 1: Look for existing user by googleId or email
+    let user = await User.findOne({ googleId });
+    if (!user) {
+      user = await User.findOne({ email });
+      if (user) {
+        // Link googleId to existing user account safely without duplicating
+        const updates = { googleId };
+        if (!user.avatar && picture) {
+          updates.avatar = picture;
+        }
+        await User.findByIdAndUpdate(user._id, updates);
+        user = await User.findById(user._id);
+      }
+    }
+
+    // Step 2: If user does not exist, create a real account in the database
+    let isNewUser = false;
+    if (!user) {
+      isNewUser = true;
+      user = await User.create({
+        name: name.trim(),
+        email,
+        googleId,
+        authProvider: 'google',
+        role: 'user', // Always standard user by default; never elevated based on email
+        avatar: picture,
+        headline: 'Skill Enthusiast from Pakistan'
+      });
+
+      await Profile.create({
+        user: user._id,
+        bio: 'Excited to barter skills and learn with the Pakistani community!',
+        city: 'Lahore',
+        learningMode: 'Both',
+        availability: 'Evenings & Weekends (PKT)',
+        rating: 0,
+        reviewCount: 0,
+        ratings: [],
+        teachingSkills: [],
+        learningSkills: []
+      });
+    }
+
+    // Step 3: Check account status (e.g., suspension)
+    if (user.isSuspended) {
+      return res.status(403).json({
+        success: false,
+        isSuspended: true,
+        message: `Your account has been suspended by administration.${user.suspensionReason ? ` Reason: ${user.suspensionReason}` : ''}`
+      });
+    }
+
+    // Step 4: Update lastActiveAt
+    await User.findByIdAndUpdate(user._id, { lastActiveAt: new Date() });
+
+    // Step 5: Fetch profile
+    let profile = null;
+    try {
+      profile = await Profile.findOne({ user: user._id })
+        .populate('teachingSkills.skill')
+        .populate('learningSkills.skill')
+        .populate('ratings.rater', 'name avatar headline');
+    } catch (profErr) {
+      profile = await Profile.findOne({ user: user._id });
+    }
+
+    // Step 6: Issue application's normal JWT token
+    const tokenPayload = generateToken(user._id);
+    const safeUser = getSafeUser(user);
+
+    res.json({
+      success: true,
+      token: tokenPayload,
+      user: safeUser,
+      profile,
+      isNewUser
+    });
+  } catch (error) {
+    console.error('Google authentication server error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error during Google authentication'
+    });
   }
 });
 
